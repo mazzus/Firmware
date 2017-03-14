@@ -1429,9 +1429,11 @@ void MulticopterPositionControl::control_auto(float dt)
 
 	bool current_setpoint_valid = false;
 	bool previous_setpoint_valid = false;
+	bool next_setpoint_valid = false;
 
 	math::Vector<3> prev_sp;
 	math::Vector<3> curr_sp;
+	math::Vector<3> next_sp;
 
 	if (_pos_sp_triplet.current.valid) {
 
@@ -1461,82 +1463,90 @@ void MulticopterPositionControl::control_auto(float dt)
 		}
 	}
 
+
+	if (_pos_sp_triplet.next.valid) {
+		map_projection_project(&_ref_pos,
+				       _pos_sp_triplet.next.lat, _pos_sp_triplet.next.lon,
+				       &next_sp.data[0], &next_sp.data[1]);
+		next_sp(2) = -(_pos_sp_triplet.next.alt - _ref_alt);
+
+		if (PX4_ISFINITE(next_sp(0)) &&
+		    PX4_ISFINITE(next_sp(1)) &&
+		    PX4_ISFINITE(next_sp(2))) {
+			next_setpoint_valid = true;
+		}
+	}
+
+
 	if (current_setpoint_valid &&
 	    (_pos_sp_triplet.current.type != position_setpoint_s::SETPOINT_TYPE_IDLE)) {
 
-		/* scaled space: 1 == position error resulting max allowed speed */
 
-		math::Vector<3> cruising_speed(_params.vel_cruise(0),
-					       _params.vel_cruise(1),
-					       _params.vel_max_up);
+		/* default: just go to curr_sp */
+		_pos_sp = curr_sp;
 
-		if (PX4_ISFINITE(_pos_sp_triplet.current.cruising_speed) &&
-		    _pos_sp_triplet.current.cruising_speed > 0.1f) {
-			cruising_speed(0) = _pos_sp_triplet.current.cruising_speed;
-			cruising_speed(1) = _pos_sp_triplet.current.cruising_speed;
-		}
+		/* if next valid, we want to have smooth transition */
+		if (previous_setpoint_valid && next_setpoint_valid
+		    && (_pos_sp_triplet.current.type == position_setpoint_s::SETPOINT_TYPE_POSITION  ||
+			_pos_sp_triplet.current.type == position_setpoint_s::SETPOINT_TYPE_FOLLOW_TARGET)) {
 
-		math::Vector<3> scale = _params.pos_p.edivide(cruising_speed);
 
-		/* convert current setpoint to scaled space */
-		math::Vector<3> curr_sp_s = curr_sp.emult(scale);
+			/* scaled space: 1 == position error resulting max allowed speed */
+			math::Vector<3> cruising_speed(_params.vel_cruise(0),
+						       _params.vel_cruise(1),
+						       _params.vel_max_up);
 
-		/* by default use current setpoint as is */
-		math::Vector<3> pos_sp_s = curr_sp_s;
+			if (PX4_ISFINITE(_pos_sp_triplet.current.cruising_speed) &&
+			    _pos_sp_triplet.current.cruising_speed > 0.1f) {
+				cruising_speed(0) = _pos_sp_triplet.current.cruising_speed;
+				cruising_speed(1) = _pos_sp_triplet.current.cruising_speed;
+			}
 
-		if ((_pos_sp_triplet.current.type == position_setpoint_s::SETPOINT_TYPE_POSITION  ||
-		     _pos_sp_triplet.current.type == position_setpoint_s::SETPOINT_TYPE_FOLLOW_TARGET) &&
-		    previous_setpoint_valid) {
+			math::Vector<3> scale = _params.pos_p.edivide(cruising_speed);
 
-			/* follow "previous - current" line */
+			/* convert current setpoint to scaled space */
+			math::Vector<3> curr_sp_s = curr_sp.emult(scale);
 
-			if ((curr_sp - prev_sp).length() > MIN_DIST) {
+			/* by default use current setpoint as is */
+			math::Vector<3> pos_sp_s = curr_sp_s;
 
-				/* find X - cross point of unit sphere and trajectory */
-				math::Vector<3> pos_s = _pos.emult(scale);
-				math::Vector<3> prev_sp_s = prev_sp.emult(scale);
-				math::Vector<3> prev_curr_s = curr_sp_s - prev_sp_s;
-				math::Vector<3> curr_pos_s = pos_s - curr_sp_s;
-				float curr_pos_s_len = curr_pos_s.length();
+			/* find X - cross point of unit sphere and trajectory */
+			math::Vector<3> pos_s = _pos.emult(scale);
+			math::Vector<3> prev_sp_s = prev_sp.emult(scale);
+			math::Vector<3> prev_curr_s = curr_sp_s - prev_sp_s;
+			math::Vector<3> curr_pos_s = pos_s - curr_sp_s;
+			float curr_pos_s_len = curr_pos_s.length();
 
-				if (curr_pos_s_len < 1.0f) {
-					/* copter is closer to waypoint than unit radius */
-					/* check next waypoint and use it to avoid slowing down when passing via waypoint */
-					if (_pos_sp_triplet.next.valid) {
-						math::Vector<3> next_sp;
-						map_projection_project(&_ref_pos,
-								       _pos_sp_triplet.next.lat, _pos_sp_triplet.next.lon,
-								       &next_sp.data[0], &next_sp.data[1]);
-						next_sp(2) = -(_pos_sp_triplet.next.alt - _ref_alt);
+			/* we are close to current setpoint */
+			if (curr_pos_s_len < 1.0f) {
 
-						if ((next_sp - curr_sp).length() > MIN_DIST) {
-							math::Vector<3> next_sp_s = next_sp.emult(scale);
+				if ((next_sp - curr_sp).length() > MIN_DIST) {
 
-							/* calculate angle prev - curr - next */
-							math::Vector<3> curr_next_s = next_sp_s - curr_sp_s;
-							math::Vector<3> prev_curr_s_norm = prev_curr_s.normalized();
+					math::Vector<3> next_sp_s = next_sp.emult(scale);
 
-							/* cos(a) * curr_next, a = angle between current and next trajectory segments */
-							float cos_a_curr_next = prev_curr_s_norm * curr_next_s;
+					/* calculate angle prev - curr - next */
+					math::Vector<3> curr_next_s = next_sp_s - curr_sp_s;
+					math::Vector<3> prev_curr_s_norm = prev_curr_s.normalized();
 
-							/* cos(b), b = angle pos - curr_sp - prev_sp */
-							float cos_b = -curr_pos_s * prev_curr_s_norm / curr_pos_s_len;
+					/* cos(a) * curr_next, a = angle between current and next trajectory segments */
+					float cos_a_curr_next = prev_curr_s_norm * curr_next_s;
 
-							if (cos_a_curr_next > 0.0f && cos_b > 0.0f) {
-								float curr_next_s_len = curr_next_s.length();
+					/* cos(b), b = angle pos - curr_sp - prev_sp */
+					float cos_b = -curr_pos_s * prev_curr_s_norm / curr_pos_s_len;
 
-								/* if curr - next distance is larger than unit radius, limit it */
-								if (curr_next_s_len > 1.0f) {
-									cos_a_curr_next /= curr_next_s_len;
-								}
+					if (cos_a_curr_next > 0.0f && cos_b > 0.0f) {
+						float curr_next_s_len = curr_next_s.length();
 
-								/* feed forward position setpoint offset */
-								math::Vector<3> pos_ff = prev_curr_s_norm *
-											 cos_a_curr_next * cos_b * cos_b * (1.0f - curr_pos_s_len) *
-											 (1.0f - expf(-curr_pos_s_len * curr_pos_s_len * 20.0f));
-								pos_sp_s += pos_ff;
-							}
+						/* if curr - next distance is larger than unit radius, limit it */
+						if (curr_next_s_len > 1.0f) {
+							cos_a_curr_next /= curr_next_s_len;
 						}
+
+						/* feed forward position setpoint offset */
+						math::Vector<3> pos_ff = prev_curr_s_norm *
+									 cos_a_curr_next * cos_b * cos_b * (1.0f - curr_pos_s_len) *
+									 (1.0f - expf(-curr_pos_s_len * curr_pos_s_len * 20.0f));
+						pos_sp_s += pos_ff;
 					}
 
 				} else {
@@ -1548,21 +1558,10 @@ void MulticopterPositionControl::control_auto(float dt)
 					}
 				}
 			}
+
+			/* scale back */
+			_pos_sp = pos_sp_s.edivide(scale);
 		}
-
-		/* move setpoint not faster than max allowed speed */
-		math::Vector<3> pos_sp_old_s = _pos_sp.emult(scale);
-
-		/* difference between current and desired position setpoints, 1 = max speed */
-		math::Vector<3> d_pos_m = (pos_sp_s - pos_sp_old_s).edivide(_params.pos_p);
-		float d_pos_m_len = d_pos_m.length();
-
-		if (d_pos_m_len > dt) {
-			pos_sp_s = pos_sp_old_s + (d_pos_m / d_pos_m_len * dt).emult(_params.pos_p);
-		}
-
-		/* scale result back to normal space */
-		_pos_sp = pos_sp_s.edivide(scale);
 
 		/* update yaw setpoint if needed */
 
